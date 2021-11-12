@@ -23,6 +23,8 @@
 #define kIOMainPortDefault kIOMasterPortDefault
 #endif
 
+#define IOREG_PREFIX	"ioreg://"
+
 struct hid_osx {
 	IOHIDDeviceRef	ref;
 	CFStringRef	loop_id;
@@ -166,20 +168,28 @@ fail:
 static char *
 get_path(IOHIDDeviceRef dev)
 {
-	io_service_t	s;
-	io_string_t	path;
+	io_service_t	 s;
+	uint64_t	 id;
+	char		*path;
 
 	if ((s = IOHIDDeviceGetService(dev)) == MACH_PORT_NULL) {
 		fido_log_debug("%s: IOHIDDeviceGetService", __func__);
 		return (NULL);
 	}
 
-	if (IORegistryEntryGetPath(s, kIOServicePlane, path) != KERN_SUCCESS) {
-		fido_log_debug("%s: IORegistryEntryGetPath", __func__);
+	if (IORegistryEntryGetRegistryEntryID(s, &id) != KERN_SUCCESS) {
+		fido_log_debug("%s: IORegistryEntryGetRegistryEntryID",
+		    __func__);
 		return (NULL);
 	}
 
-	return (strdup(path));
+	if (asprintf(&path, "%s%llu", IOREG_PREFIX,
+	    (unsigned long long)id) == -1) {
+		fido_log_error(errno, "%s: asprintf", __func__);
+		return (NULL);
+	}
+
+	return (path);
 }
 
 static bool
@@ -365,6 +375,44 @@ disable_sigpipe(int fd)
 	return (0);
 }
 
+/* XXX pedro: replace this with strtonum() */
+static int
+to_uint64(const char *str, uint64_t *out)
+{
+	char *ep;
+	long long ll;
+
+	ll = strtoll(str, &ep, 10);
+	if (str == ep || *ep != '\0')
+		return (-1);
+	else if (ll == LLONG_MIN && errno == ERANGE)
+		return (-1);
+	else if (ll == LLONG_MAX && errno == ERANGE)
+		return (-1);
+	else if (ll < 0 || (unsigned long long)ll > UINT64_MAX)
+		return (-1);
+	*out = (uint64_t)ll;
+
+	return (0);
+}
+
+static io_registry_entry_t
+get_ioreg_entry(const char *path)
+{
+	uint64_t id;
+
+	if (strncmp(path, IOREG_PREFIX, strlen(IOREG_PREFIX)) != 0)
+		return (IORegistryEntryFromPath(kIOMainPortDefault, path));
+
+	if (to_uint64(path + strlen(IOREG_PREFIX), &id) == -1) {
+		fido_log_debug("%s: to_uint64", __func__);
+		return (MACH_PORT_NULL);
+	}
+
+	return (IOServiceGetMatchingService(kIOMainPortDefault,
+	    IORegistryEntryIDMatching(id)));
+}
+
 void *
 fido_hid_open(const char *path)
 {
@@ -398,9 +446,8 @@ fido_hid_open(const char *path)
 		goto fail;
 	}
 
-	if ((entry = IORegistryEntryFromPath(kIOMainPortDefault,
-	    path)) == MACH_PORT_NULL) {
-		fido_log_debug("%s: IORegistryEntryFromPath", __func__);
+	if ((entry = get_ioreg_entry(path)) == MACH_PORT_NULL) {
+		fido_log_debug("%s: get_ioreg_entry: %s", __func__, path);
 		goto fail;
 	}
 
